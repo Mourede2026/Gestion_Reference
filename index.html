@@ -197,6 +197,11 @@ function appelStatutBadge(s){
     refusee:'<span class="badge bad">Refusée</span>'
   }[s] || s;
 }
+function appelRequesterLabel(a){
+  const centreNom = centreOf(a.centreId)?.nom || '?';
+  if(a.siteOccasionnelNom) return 'Site occasionnel : '+a.siteOccasionnelNom+' (→ '+centreNom+')';
+  return centreNom;
+}
 
 /* ================= RAPPORTS TELECHARGEABLES (tous les rôles) ================= */
 const PERIOD_OPTIONS = [
@@ -371,6 +376,19 @@ function buildGestReport(u, periodType, start, end){
     return dd>=start && dd<end;
   }).map(d=>({Vehicule:ambulanceOf(d.ambulanceId)?.nom||'', Date:d.date, Description:d.description||'', Montant:d.montant||0}));
   downloadReportWorkbook({Depenses:rows}, 'Rapport_depenses', periodType, start, end, 'Rapport — Dépenses matières');
+}
+function buildSiteOccReport(u, periodType, start, end){
+  const mesAppels = DB.appels.filter(a=>a.siteOccasionnelUserId===u.id && dateInRange(a.heure,start,end));
+  const rows = mesAppels.map(a=>{
+    const course = DB.courses.find(c=>c.siteOccasionnelAppelId===a.id);
+    return {
+      Date: fmtDT(a.heure), Ambulance: ambulanceOf(a.ambulanceId)?.nom||'',
+      Lieu_prise_en_charge: a.lieuPriseEnCharge||'', Destination: a.destination||'',
+      Statut_appel: a.statut, Distance_km: course?.distanceKm!=null?course.distanceKm.toFixed(1):'',
+      Montant_FCFA: course?.coutEstime||'', Paiement: course ? (course.paiementStatut==='recu'?'Reçu':'En attente') : ''
+    };
+  });
+  downloadReportWorkbook({Demandes:rows}, 'Rapport_'+slug(u.nom||'site'), periodType, start, end, 'Rapport — '+(u.nom||'Site occasionnel'));
 }
 function buildAdminReport(u, periodType, start, end){
   const taux = DB.settings.taux3pct||0.03;
@@ -571,7 +589,7 @@ let HANDOFF_POLL_TIMER = null;
 const HANDOFF_TIMEOUT_MS = 45000;
 let INCOMING_HANDOFF = null; // {requestId, requestedAt} — côté appareil déjà connecté qui reçoit la demande
 
-const ROLE_LABELS = {agent:'Agent de santé', chef_poste:'Chef de poste', raf:'RAF (commune)', ambulancier:'Ambulancier', gestionnaire:'Gestionnaire matières', admin:'Administrateur'};
+const ROLE_LABELS = {agent:'Agent de santé', chef_poste:'Chef de poste', raf:'RAF (commune)', ambulancier:'Ambulancier', gestionnaire:'Gestionnaire matières', admin:'Administrateur', site_occasionnel:'Site occasionnel (sans GPS)'};
 
 const AMBULANCE_ICON_SVG = `
 <svg viewBox="0 0 100 64" xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
@@ -738,7 +756,7 @@ function buildSeed(){
     centres, users, ambulances,
     courses:[], appels:[], depenses:[],
     finances:{},
-    settings:{ taux3pct:0.03, prixCarburantLitre:750, consoDefaut:12, codeArretMission:'1234', rayonAppelMetres:50 }
+    settings:{ taux3pct:0.03, prixCarburantLitre:750, consoDefaut:12, codeArretMission:'1234', rayonAppelMetres:50, coutParKmSollicitation:500, merchantMTN:'', merchantMoov:'' }
   };
 }
 
@@ -789,6 +807,9 @@ async function migrateData(){
   let settingsChanged = false;
   if(!DB.settings.codeArretMission){ DB.settings.codeArretMission = '1234'; settingsChanged = true; }
   if(!DB.settings.rayonAppelMetres){ DB.settings.rayonAppelMetres = 50; settingsChanged = true; }
+  if(!DB.settings.coutParKmSollicitation){ DB.settings.coutParKmSollicitation = 500; settingsChanged = true; }
+  if(DB.settings.merchantMTN===undefined){ DB.settings.merchantMTN = ''; settingsChanged = true; }
+  if(DB.settings.merchantMoov===undefined){ DB.settings.merchantMoov = ''; settingsChanged = true; }
   // Nettoyage : une ambulance ne doit jamais avoir plus d'une course "en_cours" à la fois.
   // Si un incident antérieur en a laissé plusieurs, on ne garde que la plus récente (ou celle
   // référencée par coursActuelle) et on clôture les autres comme "interrompue".
@@ -824,6 +845,8 @@ let GEO_WATCH_ID = null;
 let POLL_TIMER = null;
 let AGENT_GEO_TIMER = null;
 let AGENT_LIVE_POS = null; // {lat,lng,accuracy,t} — position en direct du centre connecté (agent / chef de poste)
+let AMB_PAIEMENT_COURSE_ID = null; // course pour laquelle l'ambulancier est en train de confirmer un paiement reçu
+let AMB_PAIEMENT_MODE = null; // 'especes' | 'mtn' | 'moov'
 
 function currentUser(){ return DB.users.find(u=>u.id===SESSION?.userId) || null; }
 function centreOf(id){ return DB.centres.find(c=>c.id===id); }
@@ -1169,6 +1192,7 @@ function renderBody(u){
   if(u.role==='ambulancier') return renderAmbulancier(u);
   if(u.role==='gestionnaire') return renderGestionnaire(u);
   if(u.role==='admin') return renderAdmin(u);
+  if(u.role==='site_occasionnel') return renderSiteOccasionnel(u);
   return '<p>Rôle inconnu.</p>';
 }
 
@@ -1464,9 +1488,9 @@ function renderAmbDashboard(u, amb){
     <h3>Appels en attente</h3>
     ${pending.map(p=>{
       const c = centreOf(p.centreId);
-      const d = (amb?.lat!=null && c?.lat!=null) ? haversine(amb.lat,amb.lng,c.lat,c.lng) : null;
+      const d = p.distanceKm!=null ? p.distanceKm : ((amb?.lat!=null && c?.lat!=null) ? haversine(amb.lat,amb.lng,c.lat,c.lng) : null);
       return `<div class="row">
-        <div><strong>${esc(c?.nom)}</strong><div class="muted small">${esc(c?.arrondissement)} · appel reçu ${fmtDT(p.heure)} ${d!=null?'· ~'+d.toFixed(1)+' km':''}</div></div>
+        <div><strong>${esc(appelRequesterLabel(p))}</strong><div class="muted small">${esc(c?.arrondissement||'')} · appel reçu ${fmtDT(p.heure)} ${d!=null?'· ~'+d.toFixed(1)+' km':''}</div></div>
         <div><button class="btn small primary" data-accept-call="${p.id}">Accepter</button> <button class="btn small" data-decline-call="${p.id}">Refuser</button></div>
       </div>`;
     }).join('')}
@@ -1476,32 +1500,72 @@ function renderAmbDashboard(u, amb){
 
   ${courseActive ? `
   <div class="card" style="border-color:var(--teal);">
-    <h3>Course en cours ${courseActive.centreId? '— pour '+esc(centreOf(courseActive.centreId)?.nom) : '— retour au garage'}</h3>
+    <h3>Course en cours ${courseActive.siteOccasionnelNom ? '— pour '+esc(courseActive.siteOccasionnelNom) : (courseActive.centreId? '— pour '+esc(centreOf(courseActive.centreId)?.nom) : '— retour au garage')}</h3>
+    ${courseActive.siteOccasionnelNom ? `<p class="muted small">${esc(courseActive.lieuPriseEnCharge||'Lieu de prise en charge non précisé')} → ${esc(courseActive.destination||'Destination non précisée')}</p>` : ''}
     <p class="muted small">Départ : ${fmtDT(courseActive.heureDebut)} ${courseActive.heureArriveeCentre?(' · Arrivé au centre : '+fmtDT(courseActive.heureArriveeCentre)):''}</p>
     <div class="pillrow">
       ${courseActive.centreId && !courseActive.heureArriveeCentre ? `<button class="btn small" id="arriveCentreBtn">Je suis arrivé au centre demandeur</button>` : ''}
-      ${courseActive.centreId ? `<button class="btn small primary" id="endMissionBtn">Patient admis au centre de référence / mission terminée</button>` : `<button class="btn small primary" id="endRetourBtn">Arrivé au garage — terminer le retour</button>`}
+      ${(courseActive.centreId || courseActive.siteOccasionnelAppelId) ? `<button class="btn small primary" id="endMissionBtn">${courseActive.siteOccasionnelAppelId ? 'Patient déposé à destination / mission terminée' : 'Patient admis au centre de référence / mission terminée'}</button>` : `<button class="btn small primary" id="endRetourBtn">Arrivé au garage — terminer le retour</button>`}
     </div>
   </div>` : `
   <div class="card">
     <p class="muted">Aucune course en cours. ${amb?.statut==='disponible' ? "Vous recevrez ici les appels des centres." : ''}</p>
     ${amb && amb.statut!=='disponible' && amb.statut!=='en_panne' ? `<button class="btn small" id="startRetourBtn">Démarrer un trajet de retour au garage</button>` : ''}
   </div>`}
+  ${renderAmbPaiementsAConfirmer(amb)}
   `;
 }
 
+function renderAmbPaiementsAConfirmer(amb){
+  if(!amb) return '';
+  const enAttente = DB.courses.filter(c=>c.ambulanceId===amb.id && c.paiementStatut==='en_attente');
+  if(enAttente.length===0) return '';
+  return `<div class="card" style="border-color:var(--amber); background:var(--amber-pale);">
+    <h3>Paiement(s) à confirmer</h3>
+    <p class="muted small">Confirmez ici dès que vous avez réellement reçu le paiement du demandeur (espèces ou mobile money). Un reçu sera généré automatiquement et restera visible dans votre historique.</p>
+    ${enAttente.map(c=>`
+      <div class="row">
+        <div>
+          <strong>${esc(c.siteOccasionnelNom||'Demandeur')}</strong>
+          <div class="muted small">${c.distanceKm!=null?c.distanceKm.toFixed(1)+' km':'?'} — Montant dû : ${money(c.coutEstime||0)}</div>
+        </div>
+        <div>${AMB_PAIEMENT_COURSE_ID===c.id ? '' : `<button class="btn small primary" data-confirm-payment="${c.id}">Confirmer la réception</button>`}</div>
+      </div>
+      ${AMB_PAIEMENT_COURSE_ID===c.id ? renderAmbPaiementForm(c) : ''}
+    `).join('')}
+  </div>`;
+}
+function renderAmbPaiementForm(course){
+  return `<div class="card" style="margin:8px 0 0;">
+    <div class="pillrow" style="max-width:420px;">
+      <div class="pill ${AMB_PAIEMENT_MODE==='especes'?'active':''}" data-amb-pay-mode="especes">Espèces</div>
+      <div class="pill ${AMB_PAIEMENT_MODE==='mtn'?'active':''}" data-amb-pay-mode="mtn">MTN Mobile Money</div>
+      <div class="pill ${AMB_PAIEMENT_MODE==='moov'?'active':''}" data-amb-pay-mode="moov">Moov Money</div>
+    </div>
+    ${AMB_PAIEMENT_MODE ? `
+    <div class="grid cols-2">
+      <div><label>Montant reçu (FCFA)</label><input type="number" id="ambMontantRecu" value="${course.coutEstime||0}"></div>
+      ${AMB_PAIEMENT_MODE!=='especes' ? `<div><label>Référence de la transaction</label><input type="text" id="ambReferenceRecue" placeholder="ex : MP240716.1234.A56789"></div>` : ''}
+    </div>
+    <div id="ambPaiementErr" class="muted" style="color:var(--red); display:none; margin-bottom:8px;"></div>
+    <button class="btn primary" id="ambValidatePaymentBtn" data-course-id="${course.id}">Valider et générer le reçu</button>
+    <button class="btn small" id="ambCancelPaymentBtn">Annuler</button>
+    ` : ''}
+  </div>`;
+}
 function renderAmbHistory(u, amb){
   const mine = DB.courses.filter(c=>c.ambulanceId===amb?.id).sort((a,b)=>new Date(b.heureDebut)-new Date(a.heureDebut));
   return `<div class="card"><h3>Historique</h3>
   ${mine.length===0?'<p class="muted">Aucune course.</p>':`<table>
-  <tr><th>Centre</th><th>Début</th><th>Fin</th><th>Statut</th><th>Distance</th><th>Carburant est.</th></tr>
+  <tr><th>Centre / demandeur</th><th>Début</th><th>Fin</th><th>Statut</th><th>Distance</th><th>Carburant est.</th><th>Paiement</th></tr>
   ${mine.map(c=>`<tr>
-    <td>${c.centreId ? esc(centreOf(c.centreId)?.nom) : '<span class="muted">Retour à vide</span>'}</td>
+    <td>${c.siteOccasionnelNom ? esc(c.siteOccasionnelNom)+' <span class="muted small">(site occ.)</span>' : (c.centreId ? esc(centreOf(c.centreId)?.nom) : '<span class="muted">Retour à vide</span>')}</td>
     <td class="small">${fmtDT(c.heureDebut)}</td>
     <td class="small">${fmtDT(c.heureFin)}</td>
     <td>${courseStatutBadge(c.statut)}</td>
     <td>${c.distanceKm!=null?c.distanceKm.toFixed(1)+' km':'—'}</td>
     <td>${c.carburantL!=null?c.carburantL.toFixed(1)+' L':'—'}</td>
+    <td class="small">${!c.paiementStatut ? '<span class="muted">—</span>' : (c.paiementStatut==='recu' ? '<span class="badge ok">'+money(c.paiementMontant||0)+' — '+({especes:'Espèces',mtn:'MTN',moov:'Moov'}[c.paiementMode]||c.paiementMode)+'</span>' : '<span class="badge warn">'+money(c.coutEstime||0)+' — à confirmer</span>')}</td>
   </tr>`).join('')}
   </table>`}
   </div>`;
@@ -1563,6 +1627,117 @@ function renderGestionnaire(u){
 }
 
 /* ============================================================
+   VUE SITE OCCASIONNEL (sans GPS enregistré)
+   ============================================================ */
+let SITE_OCC_SELECTED_AMB = null;
+
+function renderSiteOccasionnel(u){
+  const tabs = ['Demander une ambulance','Historique de mes demandes','Rapport'];
+  const active = SUBVIEW || tabs[0];
+  let body='';
+  if(active===tabs[0]) body = renderSiteOccDemande(u);
+  else if(active===tabs[1]) body = renderSiteOccHistorique(u);
+  else body = renderReportCard();
+  return `
+  <div class="card" style="background:var(--teal-pale); border-color:var(--teal);">
+    <strong>${esc(u.nom)}</strong>
+    <div class="muted small">Site occasionnel — sans position GPS enregistrée. Le prix de la course est calculé à l'arrivée, sur la distance réellement parcourue par l'ambulance (départ → lieu de prise en charge → destination), et c'est l'ambulancier qui confirme la réception du paiement.</div>
+  </div>
+  <div class="tabs">${tabs.map(t=>`<div class="tab ${t===active?'active':''}" data-tab="${esc(t)}">${esc(t)}</div>`).join('')}</div>
+  ${body}`;
+}
+
+function renderSiteOccDemande(u){
+  const amb = SITE_OCC_SELECTED_AMB ? ambulanceOf(SITE_OCC_SELECTED_AMB) : null;
+  const disponibles = DB.ambulances.filter(a=>a.statut==='disponible');
+  const dejaEnAttente = SITE_OCC_SELECTED_AMB ? DB.appels.some(a=>a.ambulanceId===SITE_OCC_SELECTED_AMB && a.siteOccasionnelUserId===u.id && a.statut==='en_attente') : false;
+
+  let html = `<div class="card">
+    <h3>1. Choisir une ambulance disponible</h3>
+    ${disponibles.length===0 ? '<p class="muted">Aucune ambulance disponible actuellement.</p>' : `
+    <table>
+      <tr><th>Ambulance</th><th>Position actuelle</th><th></th></tr>
+      ${disponibles.map(a=>`<tr>
+        <td><strong>${esc(a.nom)}</strong></td>
+        <td class="small">${a.lat!=null ? a.lat.toFixed(4)+', '+a.lng.toFixed(4) : '<span class="muted">position non disponible</span>'}</td>
+        <td><button class="btn small ${SITE_OCC_SELECTED_AMB===a.id?'primary':''}" data-occ-choose-amb="${a.id}">${SITE_OCC_SELECTED_AMB===a.id?'Sélectionnée':'Choisir'}</button></td>
+      </tr>`).join('')}
+    </table>`}
+  </div>`;
+  if(!amb) return html;
+
+  html += `<div class="card">
+    <h3>2. Informations sur le trajet (facultatif, aide l'ambulancier)</h3>
+    <div class="grid cols-2">
+      <div><label>Lieu de prise en charge</label><input type="text" id="occLieuPriseEnCharge" placeholder="ex : Maison de Mme X, quartier Y"></div>
+      <div><label>Destination</label><input type="text" id="occDestination" placeholder="ex : Hôpital Z (non enregistré dans l'app)"></div>
+    </div>
+    <p class="hint">Le prix exact sera calculé <strong>à l'arrivée</strong>, sur la distance réellement parcourue par l'ambulance — aucun paiement n'est demandé maintenant.</p>
+    ${dejaEnAttente ? `<p class="muted" style="color:var(--amber);">Un appel est déjà en attente de réponse pour cette ambulance.</p>` : `
+    <button class="btn primary" id="occSendCallBtn">Envoyer la demande à l'ambulancier</button>`}
+  </div>`;
+  return html;
+}
+
+function renderSiteOccHistorique(u){
+  const mesAppels = DB.appels.filter(a=>a.siteOccasionnelUserId===u.id).sort((a,b)=>new Date(b.heure)-new Date(a.heure));
+  return `<div class="card"><h3>Historique de mes demandes</h3>
+  ${mesAppels.length===0?'<p class="muted">Aucune demande pour le moment.</p>':`
+  <table>
+    <tr><th>Date</th><th>Ambulance</th><th>Trajet</th><th>Statut appel</th><th>Distance</th><th>Montant</th><th>Paiement</th></tr>
+    ${mesAppels.map(a=>{
+      const course = DB.courses.find(c=>c.siteOccasionnelAppelId===a.id);
+      return `<tr>
+      <td class="small">${fmtDT(a.heure)}</td>
+      <td>${esc(ambulanceOf(a.ambulanceId)?.nom||'?')}</td>
+      <td class="small">${esc(a.lieuPriseEnCharge||'—')} → ${esc(a.destination||'—')}</td>
+      <td>${appelStatutBadge(a.statut)}</td>
+      <td class="small">${course?.distanceKm!=null?course.distanceKm.toFixed(1)+' km':'—'}</td>
+      <td class="small">${course?.coutEstime!=null?money(course.coutEstime):'—'}</td>
+      <td>${!course ? '<span class="muted small">—</span>' : (course.paiementStatut==='recu' ? '<span class="badge ok">Reçu par l\u2019ambulancier</span>' : '<span class="badge warn">En attente</span>')}</td>
+    </tr>`;
+    }).join('')}
+  </table>`}
+  </div>`;
+}
+
+function generateSiteOccReceipt(course, amb, requesterNom){
+  if(typeof window.jspdf==='undefined' || !window.jspdf.jsPDF){
+    toast("Le paiement est enregistré, mais le reçu PDF n'a pas pu être généré (librairie indisponible — vérifiez la connexion).");
+    return;
+  }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({unit:'pt', format:'a4'});
+  let y = 50;
+  doc.setFontSize(16); doc.setTextColor(10,63,59);
+  doc.text('Reçu de paiement — Course ambulance', 40, y); y+=24;
+  doc.setFontSize(10); doc.setTextColor(91,101,95);
+  doc.text('N° reçu : '+course.recuNumero, 40, y); y+=14;
+  doc.text('Date de paiement : '+fmtDT(course.paiementDate), 40, y); y+=20;
+  doc.autoTable({
+    startY:y,
+    head:[['Détail','Valeur']],
+    body:[
+      ['Demandeur', requesterNom||'—'],
+      ['Ambulance', amb.nom],
+      ['Lieu de prise en charge', course.lieuPriseEnCharge||'—'],
+      ['Destination', course.destination||'—'],
+      ['Distance parcourue', course.distanceKm.toFixed(1)+' km'],
+      ['Coût par km', money(DB.settings.coutParKmSollicitation||500)],
+      ['Montant dû', money(course.coutEstime)],
+      ['Montant reçu', money(course.paiementMontant)],
+      ['Mode de paiement', {especes:'Espèces', mtn:'MTN Mobile Money', moov:'Moov Money'}[course.paiementMode]||course.paiementMode],
+      ['Référence transaction', course.paiementReference||'—'],
+      ['Reçu confirmé par (ambulancier)', course.paiementConfirmeParNom||'—']
+    ],
+    styles:{fontSize:9, cellPadding:5},
+    headStyles:{fillColor:[14,92,86], textColor:255},
+    margin:{left:40,right:40}
+  });
+  doc.save('Recu_'+course.recuNumero+'.pdf');
+}
+
+/* ============================================================
    VUE ADMIN
    ============================================================ */
 function renderAdmin(u){
@@ -1596,7 +1771,7 @@ function renderAdminAppelsEnCours(){
     <table>
       <tr><th>Centre demandeur</th><th>Ambulance sollicitée</th><th>Heure de l'appel</th><th></th></tr>
       ${pendantes.map(a=>`<tr>
-        <td>${esc(centreOf(a.centreId)?.nom||'?')}</td>
+        <td>${esc(appelRequesterLabel(a))}</td>
         <td>${esc(ambulanceOf(a.ambulanceId)?.nom||'?')}</td>
         <td class="small">${fmtDT(a.heure)}</td>
         <td><button class="btn small danger" data-cancel-appel="${a.id}">Annuler l'appel</button></td>
@@ -1688,7 +1863,7 @@ function renderAdminDashboard(){
       <tr><th>Heure</th><th>Centre</th><th>Ambulance sollicitée</th><th>Statut</th></tr>
       ${registre.map(a=>`<tr>
         <td class="small">${fmtDT(a.heure)}</td>
-        <td>${esc(centreOf(a.centreId)?.nom||'?')}</td>
+        <td>${esc(appelRequesterLabel(a))}</td>
         <td>${esc(ambulanceOf(a.ambulanceId)?.nom||'?')}</td>
         <td>${appelStatutBadge(a.statut)}</td>
       </tr>`).join('')}
@@ -1755,9 +1930,10 @@ function renderAdminUsers(){
         <option value="raf">RAF (commune)</option>
         <option value="ambulancier">Ambulancier</option>
         <option value="gestionnaire">Gestionnaire matières</option>
+        <option value="site_occasionnel">Site occasionnel (sans GPS)</option>
         <option value="admin">Administrateur</option>
       </select></div>
-      <div><label>Rattachement (centre, véhicule ou commune)</label><select id="newUserRattach">
+      <div><label>Rattachement (centre, véhicule ou commune — laisser vide pour un site occasionnel)</label><select id="newUserRattach">
         <option value="">—</option>
         <optgroup label="Centres">${DB.centres.map(c=>`<option value="c:${c.id}">${esc(c.nom)}</option>`).join('')}</optgroup>
         <optgroup label="Véhicules">${DB.ambulances.map(a=>`<option value="a:${a.id}">${esc(a.nom)}</option>`).join('')}</optgroup>
@@ -1922,6 +2098,32 @@ function renderAdminFinances(){
         <td>${r.f.quittanceBase64?'<span class="badge ok">Oui</span>':'<span class="badge bad">Non</span>'}</td></tr>`;
       }).join('')}
     </table>`}
+  </div>
+  ${renderAdminSiteOccPaiements()}`;
+}
+function renderAdminSiteOccPaiements(){
+  const courses = DB.courses.filter(c=>c.siteOccasionnelAppelId).sort((a,b)=>new Date(b.heureDebut)-new Date(a.heureDebut));
+  const enAttente = courses.filter(c=>c.paiementStatut==='en_attente');
+  return `
+  <div class="card">
+    <h3>Paiements — sites occasionnels</h3>
+    <p class="muted small">Traçabilité des courses facturées à la distance réelle parcourue, avec le statut de paiement confirmé par l'ambulancier.</p>
+    ${enAttente.length>0 ? `<div class="card" style="margin:0 0 12px; border-color:var(--amber); background:var(--amber-pale);">
+      <strong>${enAttente.length} paiement(s) en attente de confirmation par l'ambulancier.</strong>
+    </div>` : ''}
+    ${courses.length===0 ? '<p class="muted">Aucune course de site occasionnel pour le moment.</p>' : `
+    <table>
+      <tr><th>Date</th><th>Demandeur</th><th>Ambulance</th><th>Distance</th><th>Montant</th><th>Statut paiement</th><th>Confirmé par</th></tr>
+      ${courses.map(c=>`<tr>
+        <td class="small">${fmtDT(c.heureDebut)}</td>
+        <td>${esc(c.siteOccasionnelNom||'?')}</td>
+        <td>${esc(ambulanceOf(c.ambulanceId)?.nom||'?')}</td>
+        <td class="small">${c.distanceKm!=null?c.distanceKm.toFixed(1)+' km':'—'}</td>
+        <td class="small">${c.coutEstime!=null?money(c.coutEstime):'—'}</td>
+        <td>${!c.paiementStatut?'<span class="muted small">Mission en cours</span>':(c.paiementStatut==='recu'?'<span class="badge ok">Reçu</span>':'<span class="badge warn">En attente</span>')}</td>
+        <td class="small">${c.paiementConfirmeParNom?esc(c.paiementConfirmeParNom)+' · '+fmtDT(c.paiementDate):'—'}</td>
+      </tr>`).join('')}
+    </table>`}
   </div>`;
 }
 
@@ -1952,6 +2154,16 @@ function renderAdminSettings(){
       <div><label>Code d'accès</label><input type="text" id="setCodeArret" value="${esc(s.codeArretMission||'')}" placeholder="ex : 1234"></div>
       <div style="display:flex; align-items:flex-end;"><button class="btn primary" id="saveCodeArretBtn" style="width:100%;">Enregistrer le code</button></div>
     </div>
+  </div>
+  <div class="card">
+    <h3>Sites occasionnels — tarification &amp; paiement mobile</h3>
+    <p class="muted small">Ces réglages s'appliquent aux sites non paramétrés (comptes "Site occasionnel", sans GPS enregistré) qui sollicitent une ambulance ponctuellement.</p>
+    <div class="grid cols-3">
+      <div><label>Coût par km (FCFA/km)</label><input type="number" id="setCoutKm" value="${s.coutParKmSollicitation||500}" min="0"></div>
+      <div><label>Numéro marchand MTN Mobile Money</label><input type="text" id="setMerchantMTN" value="${esc(s.merchantMTN||'')}" placeholder="ex : 61 00 00 00"></div>
+      <div><label>Numéro marchand Moov Money</label><input type="text" id="setMerchantMoov" value="${esc(s.merchantMoov||'')}" placeholder="ex : 95 00 00 00"></div>
+    </div>
+    <button class="btn primary" id="saveSollicitationBtn">Enregistrer</button>
   </div>
   <div class="card">
     <h3>Export de la base de données</h3>
@@ -2053,6 +2265,7 @@ function attachBodyEvents(u){
   if(u.role==='ambulancier') attachAmbEvents(u);
   if(u.role==='gestionnaire') attachGestEvents(u);
   if(u.role==='admin') attachAdminEvents(u);
+  if(u.role==='site_occasionnel') attachSiteOccEvents(u);
 
   initMaps(u);
 }
@@ -2267,6 +2480,45 @@ function attachAmbEvents(u){
   const geoBtn = document.getElementById('geoToggleBtn');
   if(geoBtn) geoBtn.onclick = ()=>{ if(!GEO_WATCH_ID) startGeoWatch(amb); render(); };
 
+  document.querySelectorAll('[data-confirm-payment]').forEach(btn=>{
+    btn.onclick = ()=>{
+      AMB_PAIEMENT_COURSE_ID = btn.getAttribute('data-confirm-payment');
+      AMB_PAIEMENT_MODE = null;
+      render();
+    };
+  });
+  document.querySelectorAll('[data-amb-pay-mode]').forEach(btn=>{
+    btn.onclick = ()=>{
+      AMB_PAIEMENT_MODE = btn.getAttribute('data-amb-pay-mode');
+      render();
+    };
+  });
+  const cancelPayBtn = document.getElementById('ambCancelPaymentBtn');
+  if(cancelPayBtn) cancelPayBtn.onclick = ()=>{ AMB_PAIEMENT_COURSE_ID = null; AMB_PAIEMENT_MODE = null; render(); };
+  const validateBtn = document.getElementById('ambValidatePaymentBtn');
+  if(validateBtn) validateBtn.onclick = async ()=>{
+    const course = DB.courses.find(c=>c.id===validateBtn.getAttribute('data-course-id'));
+    const err = document.getElementById('ambPaiementErr');
+    if(!course){ toast('Course introuvable.'); AMB_PAIEMENT_COURSE_ID=null; render(); return; }
+    const montant = Number(document.getElementById('ambMontantRecu').value||0);
+    const reference = AMB_PAIEMENT_MODE!=='especes' ? document.getElementById('ambReferenceRecue').value.trim() : '';
+    if(!montant){ err.style.display='block'; err.textContent='Indiquez le montant reçu.'; return; }
+    if(AMB_PAIEMENT_MODE!=='especes' && !reference){ err.style.display='block'; err.textContent='Indiquez la référence de la transaction.'; return; }
+    course.paiementStatut = 'recu';
+    course.paiementMode = AMB_PAIEMENT_MODE;
+    course.paiementMontant = montant;
+    course.paiementReference = reference;
+    course.paiementDate = nowISO();
+    course.paiementConfirmeParId = u.id;
+    course.paiementConfirmeParNom = u.nom;
+    course.recuNumero = 'REC-'+Date.now().toString(36).toUpperCase();
+    await saveKey('courses');
+    generateSiteOccReceipt(course, amb, course.siteOccasionnelNom);
+    toast('Paiement confirmé — reçu généré et téléchargé.');
+    AMB_PAIEMENT_COURSE_ID = null; AMB_PAIEMENT_MODE = null;
+    render();
+  };
+
   document.querySelectorAll('[data-accept-call]').forEach(btn=>{
     btn.onclick = async ()=>{
       const callId = btn.getAttribute('data-accept-call');
@@ -2286,6 +2538,14 @@ function attachAmbEvents(u){
         positions: amb.lat!=null?[{lat:amb.lat,lng:amb.lng,t:nowISO()}]:[],
         distanceKm:null, carburantL:null
       };
+      if(call.siteOccasionnelUserId){
+        newCourse.siteOccasionnelAppelId = call.id;
+        newCourse.siteOccasionnelUserId = call.siteOccasionnelUserId;
+        newCourse.siteOccasionnelNom = call.siteOccasionnelNom;
+        newCourse.lieuPriseEnCharge = call.lieuPriseEnCharge || '';
+        newCourse.destination = call.destination || '';
+        newCourse.paiementStatut = null; // sera "en_attente" à la fin de la mission, une fois le coût connu
+      }
       DB.courses.push(newCourse);
       amb.coursActuelle = newCourse.id;
       amb.statut = 'en_mission'; amb.statutDepuis = nowISO();
@@ -2293,7 +2553,7 @@ function attachAmbEvents(u){
       DB.appels.filter(a=>a.ambulanceId===amb.id && a.statut==='en_attente' && a.id!==callId).forEach(a=>a.statut='refusee');
       await saveKey('courses'); await saveKey('ambulances'); await saveKey('appels');
       startCallAlertIfNeeded(amb);
-      toast('Course démarrée pour '+ (centreOf(call.centreId)?.nom||'') );
+      toast('Course démarrée pour '+ (call.siteOccasionnelNom || centreOf(call.centreId)?.nom || '') );
       render();
     };
   });
@@ -2316,8 +2576,14 @@ function attachAmbEvents(u){
     c.statut='terminee'; c.heureFin=nowISO();
     c.distanceKm = courseDistance(c); c.carburantL = c.distanceKm*(amb.consommation/100);
     amb.coursActuelle = null; amb.statut='disponible'; amb.statutDepuis=nowISO();
+    let msg = 'Course terminée — '+c.distanceKm.toFixed(1)+' km, '+c.carburantL.toFixed(1)+' L estimés.';
+    if(c.siteOccasionnelAppelId){
+      c.coutEstime = Math.round(c.distanceKm * (DB.settings.coutParKmSollicitation||500));
+      c.paiementStatut = 'en_attente';
+      msg += ' Montant à collecter auprès du demandeur : '+money(c.coutEstime)+'.';
+    }
     await saveKey('courses'); await saveKey('ambulances');
-    toast('Course terminée — '+c.distanceKm.toFixed(1)+' km, '+c.carburantL.toFixed(1)+' L estimés.');
+    toast(msg);
     render();
   };
   const startRetourBtn = document.getElementById('startRetourBtn');
@@ -2364,6 +2630,35 @@ function attachGestEvents(u){
 }
 
 /* ---- ADMIN events ---- */
+/* ---- SITE OCCASIONNEL events ---- */
+function attachSiteOccEvents(u){
+  attachReportCard((periodType,start,end)=>buildSiteOccReport(u,periodType,start,end));
+
+  document.querySelectorAll('[data-occ-choose-amb]').forEach(btn=>{
+    btn.onclick = ()=>{
+      SITE_OCC_SELECTED_AMB = btn.getAttribute('data-occ-choose-amb');
+      render();
+    };
+  });
+  const sendBtn = document.getElementById('occSendCallBtn');
+  if(sendBtn) sendBtn.onclick = async ()=>{
+    const amb = ambulanceOf(SITE_OCC_SELECTED_AMB);
+    if(!amb || amb.statut!=='disponible'){ toast('Cette ambulance n\u2019est plus disponible — choisissez-en une autre.'); SITE_OCC_SELECTED_AMB=null; render(); return; }
+    const lieuPriseEnCharge = document.getElementById('occLieuPriseEnCharge').value.trim();
+    const destination = document.getElementById('occDestination').value.trim();
+    const appel = {
+      id:uid(), centreId:null, ambulanceId:amb.id, heure:nowISO(), statut:'en_attente',
+      siteOccasionnelUserId:u.id, siteOccasionnelNom:u.nom,
+      lieuPriseEnCharge, destination
+    };
+    DB.appels.push(appel);
+    await saveKey('appels');
+    toast('Demande envoyée à l\u2019ambulancier. Le prix sera calculé à l\u2019arrivée.');
+    SITE_OCC_SELECTED_AMB = null;
+    render();
+  };
+}
+
 function attachAdminEvents(u){
   checkAmbAlarms();
   startAdminCallAlertIfNeeded();
@@ -2596,6 +2891,13 @@ function attachAdminEvents(u){
     if(!rayon || rayon<10){ toast('Indiquez un rayon raisonnable (au moins 10 m).'); return; }
     DB.settings.rayonAppelMetres = rayon;
     await saveKey('settings'); toast('Rayon de vérification GPS mis à jour.'); render();
+  };
+  const saveSollicitationBtn = document.getElementById('saveSollicitationBtn');
+  if(saveSollicitationBtn) saveSollicitationBtn.onclick = async ()=>{
+    DB.settings.coutParKmSollicitation = Number(document.getElementById('setCoutKm').value||500);
+    DB.settings.merchantMTN = document.getElementById('setMerchantMTN').value.trim();
+    DB.settings.merchantMoov = document.getElementById('setMerchantMoov').value.trim();
+    await saveKey('settings'); toast('Paramètres des sites occasionnels mis à jour.'); render();
   };
   const exportBtn = document.getElementById('exportBtn');
   if(exportBtn) exportBtn.onclick = ()=>{
