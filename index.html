@@ -617,8 +617,8 @@ const AMBULANCE_ICON_SVG = `
 const API_URL = "https://script.google.com/macros/s/AKfycbw-s_AFiWgBfcW8ItPEvnotEQyBmZ2qD6MSLQsIfKbUiteF6OS1gtM-Ajz9pt0UEWfzYw/exec";
 const USE_SHEETS = API_URL && API_URL.indexOf('http') === 0;
 
-const KEYS = ['centres','users','ambulances','courses','appels','finances','depenses','settings'];
-let DB = { centres:[], users:[], ambulances:[], courses:[], appels:[], finances:{}, depenses:[], settings:{} };
+const KEYS = ['centres','users','ambulances','courses','appels','finances','depenses','settings','services'];
+let DB = { centres:[], users:[], ambulances:[], courses:[], appels:[], finances:{}, depenses:[], settings:{}, services:[] };
 let VERSIONS = {};
 let LAST_STORAGE_ERROR = null;
 
@@ -754,9 +754,9 @@ function buildSeed(){
 
   return {
     centres, users, ambulances,
-    courses:[], appels:[], depenses:[],
+    courses:[], appels:[], depenses:[], services:[],
     finances:{},
-    settings:{ taux3pct:0.03, prixCarburantLitre:750, consoDefaut:12, codeArretMission:'1234', rayonAppelMetres:50, coutParKmSollicitation:500, merchantMTN:'', merchantMoov:'' }
+    settings:{ taux3pct:0.03, prixCarburantLitre:750, consoDefaut:12, codeArretMission:'1234', rayonAppelMetres:50, coutParKmSollicitation:500, merchantMTN:'', merchantMoov:'', merchantCeltiis:'', factureEntete:'', factureSignataireNom:'', factureSignatureBase64:'' }
   };
 }
 
@@ -810,6 +810,14 @@ async function migrateData(){
   if(!DB.settings.coutParKmSollicitation){ DB.settings.coutParKmSollicitation = 500; settingsChanged = true; }
   if(DB.settings.merchantMTN===undefined){ DB.settings.merchantMTN = ''; settingsChanged = true; }
   if(DB.settings.merchantMoov===undefined){ DB.settings.merchantMoov = ''; settingsChanged = true; }
+  if(DB.settings.merchantCeltiis===undefined){ DB.settings.merchantCeltiis = ''; settingsChanged = true; }
+  if(DB.settings.factureEntete===undefined){ DB.settings.factureEntete = ''; settingsChanged = true; }
+  if(DB.settings.factureSignataireNom===undefined){ DB.settings.factureSignataireNom = ''; settingsChanged = true; }
+  if(DB.settings.factureSignatureBase64===undefined){ DB.settings.factureSignatureBase64 = ''; settingsChanged = true; }
+  if(!Array.isArray(DB.services)){ DB.services = []; await saveKey('services'); }
+  DB.users.forEach(us=>{
+    if(us.role==='site_occasionnel' && !us.statutCompte){ us.statutCompte = 'valide'; changed = true; }
+  });
   // Nettoyage : une ambulance ne doit jamais avoir plus d'une course "en_cours" à la fois.
   // Si un incident antérieur en a laissé plusieurs, on ne garde que la plus récente (ou celle
   // référencée par coursActuelle) et on clôture les autres comme "interrompue".
@@ -944,7 +952,9 @@ function render(){
 }
 
 /* ---------- LOGIN ---------- */
+let SHOW_REGISTER_FORM = false;
 function renderLogin(){
+  if(SHOW_REGISTER_FORM) return renderRegisterForm();
   return `
   <div class="login-wrap">
     <div class="logo">${AMBULANCE_ICON_SVG}</div>
@@ -959,7 +969,50 @@ function renderLogin(){
       <button class="btn primary" id="loginBtn" style="width:100%;">Se connecter</button>
     </div>
     <p class="small muted" style="margin-top:16px;">Chaque centre dispose d'un compte agent (identifiant = nom du centre simplifié). Demandez vos identifiants à l'administrateur si besoin.</p>
+    <p class="small" style="margin-top:10px;">Site non enregistré (maison, hôpital hors réseau...) ? <button class="link-btn" id="showRegisterBtn">Créer un compte pour solliciter une ambulance</button></p>
   </div>`;
+}
+function renderRegisterForm(){
+  return `
+  <div class="login-wrap">
+    <div class="logo">${AMBULANCE_ICON_SVG}</div>
+    <h2 style="margin:0 0 4px;">Créer un compte — Site occasionnel</h2>
+    <p class="muted">Pour un site non paramétré (maison, hôpital hors réseau...) qui souhaite pouvoir solliciter une ambulance. Votre compte devra être validé par l'administrateur avant de pouvoir être utilisé.</p>
+    <div class="card" style="text-align:left; margin-top:22px;">
+      <label>Nom du site / de la structure</label>
+      <input type="text" id="regNom" placeholder="ex : Clinique Saint Michel">
+      <label>Téléphone</label>
+      <input type="text" id="regTel" placeholder="ex : 61 00 00 00">
+      <label>Identifiant souhaité</label>
+      <input type="text" id="regId" placeholder="ex : cliniquestmichel">
+      <label>Mot de passe</label>
+      <input type="password" id="regPw">
+      <div id="regErr" class="muted" style="color:var(--red); display:none; margin-bottom:8px;"></div>
+      <button class="btn primary" id="registerBtn" style="width:100%;">Envoyer la demande d'inscription</button>
+      <button class="btn" id="cancelRegisterBtn" style="width:100%; margin-top:8px;">Retour à la connexion</button>
+    </div>
+  </div>`;
+}
+function attachRegisterEvents(){
+  const cancelBtn = document.getElementById('cancelRegisterBtn');
+  if(cancelBtn) cancelBtn.onclick = ()=>{ SHOW_REGISTER_FORM=false; render(); };
+  const registerBtn = document.getElementById('registerBtn');
+  if(registerBtn) registerBtn.onclick = async ()=>{
+    const nom = document.getElementById('regNom').value.trim();
+    const telephone = document.getElementById('regTel').value.trim();
+    const identifiant = document.getElementById('regId').value.trim();
+    const motDePasse = document.getElementById('regPw').value.trim();
+    const err = document.getElementById('regErr');
+    err.style.display='none';
+    if(!nom || !identifiant || !motDePasse){ err.style.display='block'; err.textContent='Nom, identifiant et mot de passe sont requis.'; return; }
+    if(!DATA_READY){ try{ await DATA_READY_PROMISE; }catch(e){} }
+    if(DB.users.some(x=>x.identifiant.toLowerCase()===identifiant.toLowerCase())){ err.style.display='block'; err.textContent='Cet identifiant existe déjà — choisissez-en un autre.'; return; }
+    DB.users.push({id:uid(), role:'site_occasionnel', nom, identifiant, motDePasse, telephone, statutCompte:'en_attente'});
+    await saveKey('users');
+    SHOW_REGISTER_FORM = false;
+    toast('Demande envoyée — un administrateur doit valider votre compte avant que vous puissiez solliciter une ambulance.');
+    render();
+  };
 }
 function rememberLoginIfNeeded(u){
   // Uniquement pour les rôles sans accès à "Mon compte" : une fois connectés sur leur téléphone,
@@ -984,6 +1037,9 @@ function attemptRememberedLogin(){
   btn.click();
 }
 function attachLoginEvents(){
+  const showRegBtn = document.getElementById('showRegisterBtn');
+  if(showRegBtn) showRegBtn.onclick = ()=>{ SHOW_REGISTER_FORM=true; render(); };
+  if(SHOW_REGISTER_FORM){ attachRegisterEvents(); return; }
   const btn = document.getElementById('loginBtn');
   btn.onclick = async ()=>{
     unlockAudio(); // ce clic est un vrai geste utilisateur : ça débloque le son pour les alertes automatiques à venir
@@ -1001,6 +1057,14 @@ function attachLoginEvents(){
     if(!u){ err.style.display='block'; err.textContent='Identifiant ou mot de passe incorrect.'; return; }
     if(u.role==='ambulancier' && u.actif===false){
       err.style.display='block'; err.textContent="Ce compte ambulancier a été désactivé par l'administrateur.";
+      return;
+    }
+    if(u.role==='site_occasionnel' && u.statutCompte==='en_attente'){
+      err.style.display='block'; err.textContent="Votre compte est en attente de validation par l'administrateur — réessayez plus tard.";
+      return;
+    }
+    if(u.role==='site_occasionnel' && u.statutCompte==='rejete'){
+      err.style.display='block'; err.textContent="Votre demande d'inscription a été refusée par l'administrateur.";
       return;
     }
 
@@ -1247,11 +1311,12 @@ function renderCentreHeaderCard(centre){
 }
 function renderAgent(u){
   const centre = centreOf(u.centreId);
-  const tabs = ['Ambulances disponibles','Mes courses','Rapport'];
+  const tabs = ['Ambulances disponibles','Mes courses','Annuaire','Rapport'];
   const active = SUBVIEW || tabs[0];
   let body='';
   if(active===tabs[0]) body = renderAgentAmbulances(u, centre);
   else if(active===tabs[1]) body = renderAgentCourses(u, centre);
+  else if(active===tabs[2]) body = renderServicesAnnuaireConsultation(u);
   else body = renderReportCard();
 
   return `
@@ -1339,12 +1404,13 @@ function courseStatutBadge(s){
    ============================================================ */
 function renderChefPoste(u){
   const centre = centreOf(u.centreId);
-  const tabs = ['Ambulances disponibles','Mes courses','Versement du mois','Rapport'];
+  const tabs = ['Ambulances disponibles','Mes courses','Versement du mois','Annuaire','Rapport'];
   const active = SUBVIEW || tabs[0];
   let body='';
   if(active===tabs[0]) body = renderAgentAmbulances(u, centre);
   else if(active===tabs[1]) body = renderAgentCourses(u, centre);
   else if(active===tabs[2]) body = renderChefPosteFinance(u, centre);
+  else if(active===tabs[3]) body = renderChefPosteServiceStatutCard(u) + renderServicesAnnuaireConsultation(u);
   else body = renderReportCard();
 
   return `
@@ -1630,24 +1696,46 @@ function renderGestionnaire(u){
    VUE SITE OCCASIONNEL (sans GPS enregistré)
    ============================================================ */
 let SITE_OCC_SELECTED_AMB = null;
+let SITE_OCC_PAY_COURSE_ID = null;
+let SITE_OCC_PAY_MODE = null;
+const PAIEMENT_RETARD_MS = 5*60*1000; // 5 minutes
+const PAIEMENT_MAX_IMPAYES = 3;
+
+function siteOccCoursesEnSouffrance(u){
+  return DB.courses.filter(c=>c.siteOccasionnelUserId===u.id && c.paiementStatut==='en_attente'
+    && (Date.now()-new Date(c.heureFin).getTime()) > PAIEMENT_RETARD_MS);
+}
 
 function renderSiteOccasionnel(u){
-  const tabs = ['Demander une ambulance','Historique de mes demandes','Rapport'];
+  const tabs = ['Demander une ambulance','Historique de mes demandes','Mes factures','Rapport'];
   const active = SUBVIEW || tabs[0];
   let body='';
   if(active===tabs[0]) body = renderSiteOccDemande(u);
   else if(active===tabs[1]) body = renderSiteOccHistorique(u);
+  else if(active===tabs[2]) body = renderSiteOccFactures(u);
   else body = renderReportCard();
+  const enSouffrance = siteOccCoursesEnSouffrance(u);
   return `
   <div class="card" style="background:var(--teal-pale); border-color:var(--teal);">
     <strong>${esc(u.nom)}</strong>
-    <div class="muted small">Site occasionnel — sans position GPS enregistrée. Le prix de la course est calculé à l'arrivée, sur la distance réellement parcourue par l'ambulance (départ → lieu de prise en charge → destination), et c'est l'ambulancier qui confirme la réception du paiement.</div>
+    <div class="muted small">Site occasionnel — sans position GPS enregistrée. Le prix de la course est calculé à l'arrivée, sur la distance réellement parcourue par l'ambulance.</div>
   </div>
+  ${enSouffrance.length>0 ? `<div class="card" style="border-color:var(--red); background:var(--red-pale);">
+    <strong>⚠ ${enSouffrance.length} course(s) impayée(s) depuis plus de 5 minutes.</strong>
+    <p class="muted small" style="margin:4px 0 0;">Merci de régler ${enSouffrance.length>1?'ces courses':'cette course'} dans l'onglet "Mes factures". ${enSouffrance.length>=PAIEMENT_MAX_IMPAYES ? '<strong>Aucune nouvelle demande d\u2019ambulance n\u2019est possible tant que vous avez 3 courses impayées ou plus.</strong>' : ''}</p>
+  </div>` : ''}
   <div class="tabs">${tabs.map(t=>`<div class="tab ${t===active?'active':''}" data-tab="${esc(t)}">${esc(t)}</div>`).join('')}</div>
   ${body}`;
 }
 
 function renderSiteOccDemande(u){
+  const enSouffrance = siteOccCoursesEnSouffrance(u);
+  if(enSouffrance.length>=PAIEMENT_MAX_IMPAYES){
+    return `<div class="card" style="border-color:var(--red); background:var(--red-pale);">
+      <h3>Compte temporairement bloqué</h3>
+      <p>Vous avez ${enSouffrance.length} courses impayées depuis plus de 5 minutes. Aucune nouvelle demande d'ambulance n'est possible tant que vous n'avez pas réglé au moins une de ces courses (onglet "Mes factures").</p>
+    </div>`;
+  }
   const amb = SITE_OCC_SELECTED_AMB ? ambulanceOf(SITE_OCC_SELECTED_AMB) : null;
   const disponibles = DB.ambulances.filter(a=>a.statut==='disponible');
   const dejaEnAttente = SITE_OCC_SELECTED_AMB ? DB.appels.some(a=>a.ambulanceId===SITE_OCC_SELECTED_AMB && a.siteOccasionnelUserId===u.id && a.statut==='en_attente') : false;
@@ -1694,25 +1782,96 @@ function renderSiteOccHistorique(u){
       <td>${appelStatutBadge(a.statut)}</td>
       <td class="small">${course?.distanceKm!=null?course.distanceKm.toFixed(1)+' km':'—'}</td>
       <td class="small">${course?.coutEstime!=null?money(course.coutEstime):'—'}</td>
-      <td>${!course ? '<span class="muted small">—</span>' : (course.paiementStatut==='recu' ? '<span class="badge ok">Reçu par l\u2019ambulancier</span>' : '<span class="badge warn">En attente</span>')}</td>
+      <td>${!course ? '<span class="muted small">—</span>' : (course.paiementStatut==='recu' ? '<span class="badge ok">Payée</span>' : '<span class="badge warn">Impayée</span>')}</td>
     </tr>`;
     }).join('')}
   </table>`}
   </div>`;
 }
 
+const PAYMENT_OPERATORS = [
+  ['mtn','MTN Mobile Money','#FFC72C','#1a1a1a'],
+  ['moov','Moov Money','#0057B8','#ffffff'],
+  ['celtiis','Celtiis Bénin','#F26522','#ffffff']
+];
+function renderSiteOccFactures(u){
+  const mesCourses = DB.courses.filter(c=>c.siteOccasionnelUserId===u.id).sort((a,b)=>new Date(b.heureDebut)-new Date(a.heureDebut));
+  const impayees = mesCourses.filter(c=>c.paiementStatut==='en_attente');
+  const payees = mesCourses.filter(c=>c.paiementStatut==='recu');
+  let html = `<div class="card">
+    <h3>Synthèse</h3>
+    <div class="grid cols-3">
+      <div class="card" style="margin:0;"><div class="muted small">Courses impayées</div><div style="font-size:20px; font-weight:600; color:var(--red);">${impayees.length}</div></div>
+      <div class="card" style="margin:0;"><div class="muted small">Courses payées</div><div style="font-size:20px; font-weight:600; color:var(--green);">${payees.length}</div></div>
+      <div class="card" style="margin:0;"><div class="muted small">Total payé</div><div style="font-size:20px; font-weight:600;">${money(payees.reduce((s,c)=>s+(c.paiementMontant||0),0))}</div></div>
+    </div>
+  </div>`;
+
+  if(impayees.length>0){
+    html += `<div class="card"><h3>Courses à payer</h3>`;
+    impayees.forEach(c=>{
+      html += `<div class="row">
+        <div><strong>${fmtDT(c.heureDebut)}</strong><div class="muted small">${c.distanceKm!=null?c.distanceKm.toFixed(1)+' km':'?'} — ${money(c.coutEstime||0)}</div></div>
+        <div>${SITE_OCC_PAY_COURSE_ID===c.id?'':`<button class="btn small primary" data-occ-pay-course="${c.id}">Payer cette course</button>`}</div>
+      </div>`;
+      if(SITE_OCC_PAY_COURSE_ID===c.id){
+        html += `<div class="card" style="margin:6px 0 12px;">
+          <label>Choisir l'opérateur de paiement</label>
+          <div class="pillrow">
+            ${PAYMENT_OPERATORS.map(([id,label,bg,fg])=>`<div class="pill ${SITE_OCC_PAY_MODE===id?'active':''}" data-occ-pay-mode="${id}" style="background:${SITE_OCC_PAY_MODE===id?bg:'#fff'}; color:${SITE_OCC_PAY_MODE===id?fg:'inherit'}; border-color:${bg}; font-weight:700;">${label}</div>`).join('')}
+          </div>
+          ${SITE_OCC_PAY_MODE ? `
+          <p class="hint">Effectuez le transfert de <strong>${money(c.coutEstime||0)}</strong> via ${PAYMENT_OPERATORS.find(o=>o[0]===SITE_OCC_PAY_MODE)[1]} avec vos identifiants de compte habituels, puis confirmez ci-dessous.</p>
+          <div class="grid cols-2">
+            <div><label>Montant payé (FCFA)</label><input type="number" id="occPayMontant" value="${c.coutEstime||0}"></div>
+            <div><label>Référence de la transaction (SMS)</label><input type="text" id="occPayReference" placeholder="ex : MP240716.1234.A56789"></div>
+          </div>
+          <div id="occPayErr" class="muted" style="color:var(--red); display:none; margin-bottom:8px;"></div>
+          <button class="btn primary" data-occ-confirm-pay="${c.id}">Confirmer le paiement</button>
+          <button class="btn small" id="occCancelPayBtn">Annuler</button>
+          ` : ''}
+        </div>`;
+      }
+    });
+    html += `</div>`;
+  }
+
+  html += `<div class="card"><h3>Mes factures (courses payées)</h3>
+  ${payees.length===0?'<p class="muted">Aucune facture pour le moment.</p>':`
+  <table>
+    <tr><th>Date</th><th>N° facture</th><th>Distance</th><th>Montant</th><th>Mode</th><th></th></tr>
+    ${payees.map(c=>`<tr>
+      <td class="small">${fmtDT(c.paiementDate)}</td>
+      <td class="small">${esc(c.recuNumero||'—')}</td>
+      <td class="small">${c.distanceKm.toFixed(1)} km</td>
+      <td class="small">${money(c.paiementMontant||0)}</td>
+      <td class="small">${{especes:'Espèces',mtn:'MTN',moov:'Moov',celtiis:'Celtiis'}[c.paiementMode]||c.paiementMode}</td>
+      <td><button class="btn small" data-occ-download-facture="${c.id}">Télécharger (PDF)</button></td>
+    </tr>`).join('')}
+  </table>`}
+  </div>
+  ${renderReportCard()}`;
+  return html;
+}
+
 function generateSiteOccReceipt(course, amb, requesterNom){
   if(typeof window.jspdf==='undefined' || !window.jspdf.jsPDF){
-    toast("Le paiement est enregistré, mais le reçu PDF n'a pas pu être généré (librairie indisponible — vérifiez la connexion).");
+    toast("Le paiement est enregistré, mais la facture PDF n'a pas pu être générée (librairie indisponible — vérifiez la connexion).");
     return;
   }
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({unit:'pt', format:'a4'});
   let y = 50;
+  const s = DB.settings;
+  if(s.factureEntete){
+    doc.setFontSize(10); doc.setTextColor(10,63,59);
+    s.factureEntete.split('\n').forEach(line=>{ doc.text(line, 40, y); y+=13; });
+    y += 8;
+  }
   doc.setFontSize(16); doc.setTextColor(10,63,59);
-  doc.text('Reçu de paiement — Course ambulance', 40, y); y+=24;
+  doc.text('Facture — Course ambulance', 40, y); y+=24;
   doc.setFontSize(10); doc.setTextColor(91,101,95);
-  doc.text('N° reçu : '+course.recuNumero, 40, y); y+=14;
+  doc.text('N° facture : '+course.recuNumero, 40, y); y+=14;
   doc.text('Date de paiement : '+fmtDT(course.paiementDate), 40, y); y+=20;
   doc.autoTable({
     startY:y,
@@ -1725,41 +1884,103 @@ function generateSiteOccReceipt(course, amb, requesterNom){
       ['Distance parcourue', course.distanceKm.toFixed(1)+' km'],
       ['Coût par km', money(DB.settings.coutParKmSollicitation||500)],
       ['Montant dû', money(course.coutEstime)],
-      ['Montant reçu', money(course.paiementMontant)],
-      ['Mode de paiement', {especes:'Espèces', mtn:'MTN Mobile Money', moov:'Moov Money'}[course.paiementMode]||course.paiementMode],
+      ['Montant payé', money(course.paiementMontant)],
+      ['Mode de paiement', {especes:'Espèces', mtn:'MTN Mobile Money', moov:'Moov Money', celtiis:'Celtiis Bénin'}[course.paiementMode]||course.paiementMode],
       ['Référence transaction', course.paiementReference||'—'],
-      ['Reçu confirmé par (ambulancier)', course.paiementConfirmeParNom||'—']
+      ['Confirmé par', course.paiementConfirmeParNom||'—']
     ],
     styles:{fontSize:9, cellPadding:5},
     headStyles:{fillColor:[14,92,86], textColor:255},
     margin:{left:40,right:40}
   });
-  doc.save('Recu_'+course.recuNumero+'.pdf');
+  let finalY = doc.lastAutoTable.finalY + 30;
+  if(s.factureSignataireNom || s.factureSignatureBase64){
+    doc.setFontSize(10); doc.setTextColor(91,101,95);
+    doc.text('Signature de l\u2019administrateur :', 40, finalY); finalY += 6;
+    if(s.factureSignatureBase64){
+      try{ doc.addImage(s.factureSignatureBase64, 'JPEG', 40, finalY+6, 120, 45); finalY += 55; }catch(e){}
+    }
+    if(s.factureSignataireNom){ doc.text(s.factureSignataireNom, 40, finalY+14); }
+  }
+  doc.save('Facture_'+course.recuNumero+'.pdf');
 }
 
 /* ============================================================
    VUE ADMIN
    ============================================================ */
 function renderAdmin(u){
-  const tabs = ['Tableau de bord','Appels en cours','Utilisateurs & mots de passe','Ambulances','Centres & GPS','Finances (vue globale)','Rapport','Paramètres'];
+  const tabs = ['Tableau de bord','Journal d\'activité','Appels en cours','Inscriptions','Utilisateurs & mots de passe','Ambulances','Centres & GPS','Annuaire','Finances (vue globale)','Rapport','Paramètres'];
   const active = SUBVIEW || tabs[0];
   let body='';
   if(active===tabs[0]) body = renderAdminDashboard();
-  else if(active===tabs[1]) body = renderAdminAppelsEnCours();
-  else if(active===tabs[2]) body = renderAdminUsers();
-  else if(active===tabs[3]) body = renderAdminAmbulances();
-  else if(active===tabs[4]) body = renderAdminCentres();
-  else if(active===tabs[5]) body = renderAdminFinances();
-  else if(active===tabs[6]) body = renderReportCard();
+  else if(active===tabs[1]) body = renderAdminJournal();
+  else if(active===tabs[2]) body = renderAdminAppelsEnCours();
+  else if(active===tabs[3]) body = renderAdminInscriptions();
+  else if(active===tabs[4]) body = renderAdminUsers();
+  else if(active===tabs[5]) body = renderAdminAmbulances();
+  else if(active===tabs[6]) body = renderAdminCentres();
+  else if(active===tabs[7]) body = renderAdminAnnuaire();
+  else if(active===tabs[8]) body = renderAdminFinances();
+  else if(active===tabs[9]) body = renderReportCard();
   else body = renderAdminSettings();
   return `<div class="tabs">${tabs.map(t=>{
-    const label = (t==='Appels en cours' && DB.appels.some(a=>a.statut==='en_attente'))
-      ? esc(t)+' <span class="badge bad" style="margin-left:4px;">'+DB.appels.filter(a=>a.statut==='en_attente').length+'</span>'
-      : esc(t);
+    let count = 0;
+    if(t==='Appels en cours') count = DB.appels.filter(a=>a.statut==='en_attente').length;
+    if(t==='Inscriptions') count = DB.users.filter(x=>x.role==='site_occasionnel' && x.statutCompte==='en_attente').length;
+    const label = count>0 ? esc(t)+' <span class="badge bad" style="margin-left:4px;">'+count+'</span>' : esc(t);
     return `<div class="tab ${t===active?'active':''}" data-tab="${esc(t)}">${label}</div>`;
   }).join('')}</div>${body}`;
 }
 
+function renderAdminJournal(){
+  const events = [];
+  DB.appels.forEach(a=>{
+    events.push({t:a.heure, label:'📞 Appel créé — '+appelRequesterLabel(a)+' → '+(ambulanceOf(a.ambulanceId)?.nom||'?'), badge:appelStatutBadge(a.statut)});
+  });
+  DB.courses.forEach(c=>{
+    const who = c.siteOccasionnelNom ? c.siteOccasionnelNom : (c.centreId ? (centreOf(c.centreId)?.nom||'') : 'retour à vide');
+    events.push({t:c.heureDebut, label:'🚑 Mission démarrée — '+(ambulanceOf(c.ambulanceId)?.nom||'?')+' → '+who, badge:''});
+    if(c.heureFin) events.push({t:c.heureFin, label:'🏁 Mission terminée — '+(ambulanceOf(c.ambulanceId)?.nom||'?')+(c.distanceKm!=null?' ('+c.distanceKm.toFixed(1)+' km)':''), badge:''});
+    if(c.paiementDate) events.push({t:c.paiementDate, label:'💳 Paiement confirmé — '+(c.siteOccasionnelNom||'?')+' — '+money(c.paiementMontant||0)+' ('+(c.paiementConfirmeParNom||'?')+')', badge:''});
+  });
+  events.sort((a,b)=>new Date(b.t)-new Date(a.t));
+  const recent = events.slice(0,150);
+  return `<div class="card">
+    <h3>Journal d'activité (${recent.length} derniers événements)</h3>
+    <p class="muted small">Vue chronologique de tous les appels, missions et paiements du système.</p>
+    ${recent.length===0?'<p class="muted">Aucun événement pour le moment.</p>':`
+    <table>
+      <tr><th>Heure</th><th>Événement</th><th></th></tr>
+      ${recent.map(e=>`<tr><td class="small">${fmtDT(e.t)}</td><td class="small">${esc(e.label)}</td><td>${e.badge}</td></tr>`).join('')}
+    </table>`}
+  </div>`;
+}
+function renderAdminInscriptions(){
+  const enAttente = DB.users.filter(u=>u.role==='site_occasionnel' && u.statutCompte==='en_attente');
+  const traitees = DB.users.filter(u=>u.role==='site_occasionnel' && (u.statutCompte==='valide' || u.statutCompte==='rejete'));
+  return `
+  <div class="card" ${enAttente.length?'style="border-color:var(--amber); background:var(--amber-pale);"':''}>
+    <h3>Demandes d'inscription en attente (${enAttente.length})</h3>
+    ${enAttente.length===0?'<p class="muted">Aucune demande en attente.</p>':`
+    <table>
+      <tr><th>Nom</th><th>Identifiant</th><th>Téléphone</th><th></th></tr>
+      ${enAttente.map(u=>`<tr>
+        <td>${esc(u.nom)}</td>
+        <td class="small">${esc(u.identifiant)}</td>
+        <td class="small">${esc(u.telephone||'—')}</td>
+        <td><button class="btn small primary" data-approve-inscription="${u.id}">Valider</button> <button class="btn small danger" data-reject-inscription="${u.id}">Refuser</button></td>
+      </tr>`).join('')}
+    </table>`}
+  </div>
+  <div class="card">
+    <h3>Historique des inscriptions traitées</h3>
+    ${traitees.length===0?'<p class="muted">Aucune.</p>':`
+    <table>
+      <tr><th>Nom</th><th>Identifiant</th><th>Statut</th></tr>
+      ${traitees.map(u=>`<tr><td>${esc(u.nom)}</td><td class="small">${esc(u.identifiant)}</td><td>${u.statutCompte==='valide'?'<span class="badge ok">Validé</span>':'<span class="badge bad">Refusé</span>'}</td></tr>`).join('')}
+    </table>`}
+  </div>`;
+}
 function renderAdminAppelsEnCours(){
   const pendantes = DB.appels.filter(a=>a.statut==='en_attente').sort((a,b)=>new Date(a.heure)-new Date(b.heure));
   const missionsEnCours = DB.courses.filter(c=>c.statut==='en_cours' && c.centreId);
@@ -1793,8 +2014,16 @@ function renderAdminAppelsEnCours(){
   </div>`;
 }
 
+let ADMIN_FINANCE_MOIS = null;
+function renderMonthNav(mois){
+  return `<div class="flexbetween" style="margin-bottom:10px; gap:8px;">
+    <button class="btn small" data-month-nav="-1">← Mois précédent</button>
+    <input type="month" id="adminFinanceMoisInput" value="${mois}" style="max-width:170px; margin-bottom:0;">
+    <button class="btn small" data-month-nav="1">Mois suivant →</button>
+  </div>`;
+}
 function renderAdminDashboard(){
-  const mois = curMonth();
+  const mois = ADMIN_FINANCE_MOIS || curMonth();
   const now = Date.now();
   const alarmed = DB.ambulances.filter(a=>a.statut==='en_mission' && a.statutDepuis && (now-new Date(a.statutDepuis).getTime())>AMB_ALARM_MS);
 
@@ -1846,6 +2075,7 @@ function renderAdminDashboard(){
 
   <div class="card">
     <h3>Sollicitations par centre — ${esc(mois)}</h3>
+    ${renderMonthNav(mois)}
     ${centreRows.length===0?'<p class="muted">Aucune donnée ce mois.</p>':`
     <table>
       <tr><th>Centre</th><th>Appels ce mois</th><th>Appels (total)</th><th>Recette</th><th>3% attendu</th><th>Versé déclaré</th><th>Écart</th></tr>
@@ -1997,9 +2227,15 @@ function renderAdminAmbulances(){
 }
 
 let EDIT_CENTRE_GPS_ID = null;
+let EDIT_SERVICE_ID = null;
 let CENTRE_GPS_INPUT_MODE = 'latlng'; // 'latlng' ou 'utm'
 function renderAdminCentres(){
+  const avecGPS = DB.centres.filter(c=>c.lat!=null).length;
   return `
+  <div class="card">
+    <h3>Carte des centres de santé (${avecGPS}/${DB.centres.length} positionnés)</h3>
+    <div class="mapbox" id="centresOverviewMap"></div>
+  </div>
   <div class="card">
     <h3>Formations sanitaires (${DB.centres.length})</h3>
     <p class="muted small">Seul l'administrateur peut définir la position GPS d'un centre — elle sert de référence pour autoriser les appels d'ambulance (zone de 10 m). Utilisez le bouton "Utiliser ma position actuelle" en vous tenant physiquement au centre, ou saisissez les coordonnées à la main (clic long sur le lieu dans Google Maps → les chiffres affichés sont la latitude et la longitude).</p>
@@ -2079,7 +2315,7 @@ function renderAdminCentresLiveTable(){
 }
 
 function renderAdminFinances(){
-  const mois = curMonth();
+  const mois = ADMIN_FINANCE_MOIS || curMonth();
   const rows = DB.centres.map(c=>{
     const f = DB.finances[c.id+'_'+mois] || {};
     const attendu = (f.recette||0)*(DB.settings.taux3pct||0.03);
@@ -2088,6 +2324,7 @@ function renderAdminFinances(){
   return `
   <div class="card">
     <h3>Situation financière — ${esc(mois)}</h3>
+    ${renderMonthNav(mois)}
     ${rows.length===0?'<p class="muted">Aucune donnée saisie ce mois.</p>':`
     <table>
       <tr><th>Centre</th><th>Recette</th><th>3% attendu</th><th>Versé déclaré</th><th>Écart</th><th>Quittance</th></tr>
@@ -2127,6 +2364,86 @@ function renderAdminSiteOccPaiements(){
   </div>`;
 }
 
+function renderAdminAnnuaire(){
+  return `
+  <div class="card">
+    <h3>Annuaire des services de référence (${DB.services.length})</h3>
+    <p class="muted small">Un centre demandeur peut appeler directement ces numéros pour vérifier la disponibilité d'un praticien, d'une salle, etc. avant de solliciter une ambulance. Le statut de disponibilité est facultatif et manuel — utile si un service veut le tenir à jour, mais l'appel téléphonique reste toujours possible même sans statut renseigné.</p>
+    ${DB.services.length===0?'<p class="muted">Aucun service enregistré.</p>':`
+    <table>
+      <tr><th>Service</th><th>Centre associé</th><th>Téléphone</th><th>Disponibilité</th><th></th></tr>
+      ${DB.services.map(s=>{
+        if(EDIT_SERVICE_ID===s.id){
+          return `<tr><td colspan="5">
+            <div class="grid cols-3">
+              <div><label>Nom du service</label><input type="text" id="editServiceNom" value="${esc(s.nom)}"></div>
+              <div><label>Centre associé</label><select id="editServiceCentre">
+                <option value="">—</option>
+                ${DB.centres.map(c=>`<option value="${c.id}" ${s.centreId===c.id?'selected':''}>${esc(c.nom)}</option>`).join('')}
+              </select></div>
+              <div><label>Téléphone</label><input type="text" id="editServiceTel" value="${esc(s.telephone||'')}"></div>
+            </div>
+            <button class="btn small primary" data-save-service="${s.id}">Enregistrer</button>
+            <button class="btn small" data-cancel-edit-service="1">Annuler</button>
+            <button class="btn small danger" data-del-service="${s.id}">Supprimer</button>
+          </td></tr>`;
+        }
+        return `<tr>
+        <td><strong>${esc(s.nom)}</strong></td>
+        <td class="small">${esc(centreOf(s.centreId)?.nom||'—')}</td>
+        <td class="small">${esc(s.telephone||'—')}</td>
+        <td>${s.disponible===true?'<span class="badge ok">Disponible</span>':(s.disponible===false?'<span class="badge bad">Indisponible</span>':'<span class="muted small">Non renseigné</span>')}</td>
+        <td><button class="btn small" data-edit-service="${s.id}">Modifier</button></td>
+      </tr>`;
+      }).join('')}
+    </table>`}
+  </div>
+  <div class="card">
+    <h3>Ajouter un service</h3>
+    <div class="grid cols-3">
+      <div><label>Nom du service</label><input type="text" id="newServiceNom" placeholder="ex : Bloc opératoire HZ Djidja"></div>
+      <div><label>Centre associé</label><select id="newServiceCentre">
+        <option value="">—</option>
+        ${DB.centres.map(c=>`<option value="${c.id}">${esc(c.nom)}</option>`).join('')}
+      </select></div>
+      <div><label>Téléphone</label><input type="text" id="newServiceTel" placeholder="ex : 61 00 00 00"></div>
+    </div>
+    <button class="btn primary" id="addServiceBtn">Ajouter</button>
+  </div>`;
+}
+function renderServicesAnnuaireConsultation(u){
+  if(DB.services.length===0){
+    return `<div class="card"><h3>Annuaire des services</h3><p class="muted">Aucun service n'a encore été enregistré par l'administrateur.</p></div>`;
+  }
+  return `<div class="card">
+    <h3>Annuaire des services de référence</h3>
+    <p class="muted small">Appelez directement pour vérifier la disponibilité avant de solliciter une ambulance.</p>
+    <table>
+      <tr><th>Service</th><th>Centre</th><th>Disponibilité</th><th>Téléphone</th></tr>
+      ${DB.services.map(s=>`<tr>
+        <td><strong>${esc(s.nom)}</strong></td>
+        <td class="small">${esc(centreOf(s.centreId)?.nom||'—')}</td>
+        <td>${s.disponible===true?'<span class="badge ok">Disponible</span>':(s.disponible===false?'<span class="badge bad">Indisponible</span>':'<span class="muted small">Non renseigné</span>')}</td>
+        <td>${s.telephone ? `<a class="btn small primary" href="tel:${esc(s.telephone.replace(/\s+/g,''))}">📞 ${esc(s.telephone)}</a>` : '<span class="muted small">—</span>'}</td>
+      </tr>`).join('')}
+    </table>
+  </div>`;
+}
+function renderChefPosteServiceStatutCard(u){
+  const mesServices = DB.services.filter(s=>s.centreId===u.centreId);
+  if(mesServices.length===0) return '';
+  return `<div class="card">
+    <h3>Statut de mes services (facultatif)</h3>
+    <p class="muted small">Vous pouvez indiquer si vos services sont disponibles ou non, pour informer les centres demandeurs. Ce n'est pas obligatoire — l'appel téléphonique reste toujours possible même sans mise à jour.</p>
+    ${mesServices.map(s=>`<div class="row">
+      <span>${esc(s.nom)}</span>
+      <span>
+        <button class="btn small ${s.disponible===true?'primary':''}" data-toggle-service-dispo="${s.id}" data-value="true">Disponible</button>
+        <button class="btn small ${s.disponible===false?'danger':''}" data-toggle-service-dispo="${s.id}" data-value="false">Indisponible</button>
+      </span>
+    </div>`).join('')}
+  </div>`;
+}
 function renderAdminSettings(){
   const s = DB.settings;
   return `
@@ -2162,8 +2479,26 @@ function renderAdminSettings(){
       <div><label>Coût par km (FCFA/km)</label><input type="number" id="setCoutKm" value="${s.coutParKmSollicitation||500}" min="0"></div>
       <div><label>Numéro marchand MTN Mobile Money</label><input type="text" id="setMerchantMTN" value="${esc(s.merchantMTN||'')}" placeholder="ex : 61 00 00 00"></div>
       <div><label>Numéro marchand Moov Money</label><input type="text" id="setMerchantMoov" value="${esc(s.merchantMoov||'')}" placeholder="ex : 95 00 00 00"></div>
+      <div><label>Numéro marchand Celtiis Bénin</label><input type="text" id="setMerchantCeltiis" value="${esc(s.merchantCeltiis||'')}" placeholder="ex : 55 00 00 00"></div>
     </div>
     <button class="btn primary" id="saveSollicitationBtn">Enregistrer</button>
+  </div>
+  <div class="card">
+    <h3>En-tête et signature des factures</h3>
+    <p class="muted small">Apparaissent sur chaque facture PDF envoyée aux demandeurs (sites occasionnels).</p>
+    <label>En-tête (nom de la zone sanitaire, adresse...)</label>
+    <textarea id="setFactureEntete" placeholder="ex : Zone Sanitaire Djidja-Abomey-Agbangnizoun&#10;Système de Référence Sanitaire">${esc(s.factureEntete||'')}</textarea>
+    <label>Nom de l'administrateur signataire</label>
+    <input type="text" id="setFactureSignataire" value="${esc(s.factureSignataireNom||'')}" placeholder="ex : Dr KOSSOU Jean, Administrateur">
+    <label>Image de signature (facultatif)</label>
+    <input type="file" id="setFactureSignatureImg" accept="image/*">
+    ${s.factureSignatureBase64 ? `<img src="${s.factureSignatureBase64}" class="imgprev" style="max-height:60px;">` : ''}
+    <button class="btn primary" id="saveFactureEnteteBtn" style="margin-top:8px;">Enregistrer</button>
+  </div>
+  <div class="card" style="border-color:var(--red);">
+    <h3>Remise à zéro des opérations</h3>
+    <p class="muted small">Efface tous les <strong>appels, courses, versements/recettes et dépenses</strong> pour repartir sur une base propre — sans toucher aux comptes, ambulances, centres, positions GPS, ni aux paramètres. Action irréversible, protégée par le code d'accès administrateur.</p>
+    <button class="btn danger" id="resetOperationsBtn">Réinitialiser toutes les opérations</button>
   </div>
   <div class="card">
     <h3>Export de la base de données</h3>
@@ -2335,6 +2670,16 @@ function attachChefPosteEvents(u){
     toast('Versement enregistré et validé.');
     render();
   };
+  document.querySelectorAll('[data-toggle-service-dispo]').forEach(sbtn=>{
+    sbtn.onclick = async ()=>{
+      const s = DB.services.find(x=>x.id===sbtn.getAttribute('data-toggle-service-dispo'));
+      if(!s) return;
+      s.disponible = sbtn.getAttribute('data-value')==='true';
+      await saveKey('services');
+      toast('Statut mis à jour.');
+      render();
+    };
+  });
 }
 
 /* ---- RAF events ---- */
@@ -2657,12 +3002,128 @@ function attachSiteOccEvents(u){
     SITE_OCC_SELECTED_AMB = null;
     render();
   };
+
+  document.querySelectorAll('[data-occ-pay-course]').forEach(btn=>{
+    btn.onclick = ()=>{
+      SITE_OCC_PAY_COURSE_ID = btn.getAttribute('data-occ-pay-course');
+      SITE_OCC_PAY_MODE = null;
+      render();
+    };
+  });
+  document.querySelectorAll('[data-occ-pay-mode]').forEach(btn=>{
+    btn.onclick = ()=>{
+      SITE_OCC_PAY_MODE = btn.getAttribute('data-occ-pay-mode');
+      render();
+    };
+  });
+  const cancelPayBtn = document.getElementById('occCancelPayBtn');
+  if(cancelPayBtn) cancelPayBtn.onclick = ()=>{ SITE_OCC_PAY_COURSE_ID=null; SITE_OCC_PAY_MODE=null; render(); };
+  document.querySelectorAll('[data-occ-confirm-pay]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const course = DB.courses.find(c=>c.id===btn.getAttribute('data-occ-confirm-pay'));
+      const err = document.getElementById('occPayErr');
+      if(!course){ toast('Course introuvable.'); render(); return; }
+      const montant = Number(document.getElementById('occPayMontant').value||0);
+      const reference = document.getElementById('occPayReference').value.trim();
+      if(!montant){ err.style.display='block'; err.textContent='Indiquez le montant payé.'; return; }
+      if(!reference){ err.style.display='block'; err.textContent='Indiquez la référence de la transaction reçue par SMS.'; return; }
+      course.paiementStatut = 'recu';
+      course.paiementMode = SITE_OCC_PAY_MODE;
+      course.paiementMontant = montant;
+      course.paiementReference = reference;
+      course.paiementDate = nowISO();
+      course.paiementConfirmeParId = u.id;
+      course.paiementConfirmeParNom = u.nom+' (auto-déclaré par le demandeur)';
+      course.recuNumero = 'FAC-'+Date.now().toString(36).toUpperCase();
+      await saveKey('courses');
+      const amb = ambulanceOf(course.ambulanceId);
+      generateSiteOccReceipt(course, amb, u.nom);
+      toast('Paiement confirmé — facture générée et téléchargée.');
+      SITE_OCC_PAY_COURSE_ID = null; SITE_OCC_PAY_MODE = null;
+      render();
+    };
+  });
+  document.querySelectorAll('[data-occ-download-facture]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const course = DB.courses.find(c=>c.id===btn.getAttribute('data-occ-download-facture'));
+      if(!course) return;
+      const amb = ambulanceOf(course.ambulanceId);
+      generateSiteOccReceipt(course, amb, u.nom);
+    };
+  });
 }
 
 function attachAdminEvents(u){
   checkAmbAlarms();
   startAdminCallAlertIfNeeded();
   attachReportCard((periodType,start,end)=>buildAdminReport(u,periodType,start,end));
+
+  document.querySelectorAll('[data-month-nav]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const delta = Number(btn.getAttribute('data-month-nav'));
+      const cur = ADMIN_FINANCE_MOIS || curMonth();
+      const d = new Date(cur+'-01T00:00:00');
+      d.setMonth(d.getMonth()+delta);
+      ADMIN_FINANCE_MOIS = d.toISOString().slice(0,7);
+      render();
+    };
+  });
+  const moisInput = document.getElementById('adminFinanceMoisInput');
+  if(moisInput) moisInput.onchange = ()=>{ ADMIN_FINANCE_MOIS = moisInput.value; render(); };
+
+  document.querySelectorAll('[data-approve-inscription]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const us = DB.users.find(x=>x.id===btn.getAttribute('data-approve-inscription'));
+      if(!us) return;
+      us.statutCompte = 'valide';
+      await saveKey('users');
+      toast(esc(us.nom)+' validé — peut maintenant solliciter des ambulances.');
+      render();
+    };
+  });
+  document.querySelectorAll('[data-reject-inscription]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const us = DB.users.find(x=>x.id===btn.getAttribute('data-reject-inscription'));
+      if(!us) return;
+      us.statutCompte = 'rejete';
+      await saveKey('users');
+      toast('Demande refusée.');
+      render();
+    };
+  });
+
+  const addServiceBtn = document.getElementById('addServiceBtn');
+  if(addServiceBtn) addServiceBtn.onclick = async ()=>{
+    const nom = document.getElementById('newServiceNom').value.trim();
+    const centreId = document.getElementById('newServiceCentre').value || null;
+    const telephone = document.getElementById('newServiceTel').value.trim();
+    if(!nom){ toast('Le nom du service est requis.'); return; }
+    DB.services.push({id:uid(), nom, centreId, telephone, disponible:null});
+    await saveKey('services'); toast('Service ajouté.'); render();
+  };
+  document.querySelectorAll('[data-edit-service]').forEach(btn=>{
+    btn.onclick = ()=>{ EDIT_SERVICE_ID = btn.getAttribute('data-edit-service'); render(); };
+  });
+  document.querySelectorAll('[data-cancel-edit-service]').forEach(btn=>{
+    btn.onclick = ()=>{ EDIT_SERVICE_ID = null; render(); };
+  });
+  document.querySelectorAll('[data-save-service]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const s = DB.services.find(x=>x.id===btn.getAttribute('data-save-service'));
+      s.nom = document.getElementById('editServiceNom').value.trim() || s.nom;
+      s.centreId = document.getElementById('editServiceCentre').value || null;
+      s.telephone = document.getElementById('editServiceTel').value.trim();
+      EDIT_SERVICE_ID = null;
+      await saveKey('services'); toast('Service mis à jour.'); render();
+    };
+  });
+  document.querySelectorAll('[data-del-service]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      DB.services = DB.services.filter(x=>x.id!==btn.getAttribute('data-del-service'));
+      EDIT_SERVICE_ID = null;
+      await saveKey('services'); toast('Service supprimé.'); render();
+    };
+  });
 
   document.querySelectorAll('[data-cancel-appel]').forEach(btn=>{
     btn.onclick = async ()=>{
@@ -2720,6 +3181,7 @@ function attachAdminEvents(u){
     if(!nom||!identifiant||!motDePasse){ toast('Nom, identifiant et mot de passe sont requis.'); return; }
     if(DB.users.some(x=>x.identifiant.toLowerCase()===identifiant.toLowerCase())){ toast('Cet identifiant existe déjà.'); return; }
     const nu = {id:uid(), nom, role, identifiant, motDePasse, telephone, sessionToken:null, sessionLastSeen:null, handoffRequest:null};
+    if(role==='site_occasionnel') nu.statutCompte = 'valide';
     if(rattach.startsWith('c:')) nu.centreId = rattach.slice(2);
     if(rattach.startsWith('a:')) nu.ambulanceId = rattach.slice(2);
     if(rattach.startsWith('m:')) nu.commune = rattach.slice(2);
@@ -2897,7 +3359,35 @@ function attachAdminEvents(u){
     DB.settings.coutParKmSollicitation = Number(document.getElementById('setCoutKm').value||500);
     DB.settings.merchantMTN = document.getElementById('setMerchantMTN').value.trim();
     DB.settings.merchantMoov = document.getElementById('setMerchantMoov').value.trim();
+    DB.settings.merchantCeltiis = document.getElementById('setMerchantCeltiis').value.trim();
     await saveKey('settings'); toast('Paramètres des sites occasionnels mis à jour.'); render();
+  };
+  const saveFactureEnteteBtn = document.getElementById('saveFactureEnteteBtn');
+  if(saveFactureEnteteBtn) saveFactureEnteteBtn.onclick = async ()=>{
+    DB.settings.factureEntete = document.getElementById('setFactureEntete').value.trim();
+    DB.settings.factureSignataireNom = document.getElementById('setFactureSignataire').value.trim();
+    const fileInput = document.getElementById('setFactureSignatureImg');
+    if(fileInput && fileInput.files && fileInput.files[0]){
+      DB.settings.factureSignatureBase64 = await fileToCompressedBase64(fileInput.files[0]);
+    }
+    await saveKey('settings'); toast('En-tête et signature des factures mis à jour.'); render();
+  };
+  const resetOperationsBtn = document.getElementById('resetOperationsBtn');
+  if(resetOperationsBtn) resetOperationsBtn.onclick = ()=>{
+    showAccessCodeConfirm(
+      "Vous êtes sur le point d'effacer TOUS les appels, courses, versements/recettes et dépenses de l'application. Les comptes, ambulances, centres et leurs positions GPS, ainsi que les paramètres, ne seront PAS modifiés. Cette action est irréversible.",
+      async ()=>{
+        DB.appels = [];
+        DB.courses = [];
+        DB.finances = {};
+        DB.depenses = [];
+        DB.ambulances.forEach(a=>{ a.statut='disponible'; a.coursActuelle=null; a.statutDepuis=nowISO(); });
+        DB.centres.forEach(c=>{ delete c.liveLat; delete c.liveLng; delete c.liveAccuracy; delete c.liveLastUpdate; });
+        await saveKey('appels'); await saveKey('courses'); await saveKey('finances'); await saveKey('depenses'); await saveKey('ambulances'); await saveKey('centres');
+        toast('Toutes les opérations ont été réinitialisées. Comptes, ambulances, centres et paramètres sont conservés.');
+        render();
+      }
+    );
   };
   const exportBtn = document.getElementById('exportBtn');
   if(exportBtn) exportBtn.onclick = ()=>{
@@ -2909,6 +3399,18 @@ function attachAdminEvents(u){
 
 /* ================= CARTES ================= */
 function initMaps(u){
+  if(u.role==='admin' && document.getElementById('centresOverviewMap')){
+    const map = L.map('centresOverviewMap', {scrollWheelZoom:false});
+    map.setView([7.18,1.99], 9);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
+    DB.centres.forEach(c=>{
+      if(c.lat!=null){
+        const color = c.reference ? '#0E5C56' : '#5B655F';
+        L.circleMarker([c.lat,c.lng],{radius:c.reference?7:5,color,fillColor:color,fillOpacity:.8}).addTo(map)
+          .bindPopup('<strong>'+c.nom+'</strong><br>'+c.arrondissement+' · '+c.commune+(c.reference?'<br><em>Centre de référence</em>':''));
+      }
+    });
+  }
   if(u.role==='admin' && document.getElementById('centreGpsPreviewMap')){
     const readLatLngFromInputs = ()=>{
       if(CENTRE_GPS_INPUT_MODE==='utm'){
